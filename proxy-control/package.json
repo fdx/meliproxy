@@ -1,0 +1,23 @@
+{
+  "name": "proxy-control",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "bootstrap": "^3.3.7",
+    "d3": "v3.5.17",
+    "rd3": "^0.8.1",
+    "react": "^16.0.0",
+    "react-d3-basic": "^1.6.11",
+    "react-d3-library": "^1.1.8",
+    "react-dom": "^16.0.0",
+    "react-scripts": "1.0.17",
+    "recharts": "^1.0.0-beta.0",
+    "word-wrap": "^1.2.3"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test --env=jsdom",
+    "eject": "react-scripts eject"
+  }
+}

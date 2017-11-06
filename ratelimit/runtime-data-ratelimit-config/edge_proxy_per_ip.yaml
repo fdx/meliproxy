@@ -1,0 +1,12 @@
+domain: edge_proxy_per_ip
+descriptors:
+  - key: remote_address
+    rate_limit:
+      unit: minute
+      requests_per_unit: 10
+
+  - key: remote_address
+    value: 192.168.99.1
+    rate_limit:
+      unit: minute
+      requests_per_unit: 3

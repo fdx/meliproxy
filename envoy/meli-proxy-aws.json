@@ -1,0 +1,95 @@
+{
+  "listeners": [
+    {
+      "address": "tcp://0.0.0.0:80",
+      "filters": [
+        {
+          "name": "http_connection_manager",
+          "config": {
+            "codec_type": "auto",
+            "stat_prefix": "ingress_http",
+            "route_config": {
+              "virtual_hosts": [
+                {
+                  "name": "meli_api",
+                  "domains": ["*"],
+                  "routes": [
+                    {
+                      "timeout_ms": 0,
+                      "prefix": "/",
+                      "host_rewrite": "api.mercadolibre.com",
+                      "cluster": "service_mercadolibre",
+                      "rate_limits": [
+                        { "actions": [
+                          { "type": "remote_address" }
+                        ] }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            "filters": [
+              {
+                "name": "rate_limit",
+                "config": {
+                  "domain": "edge_proxy_per_ip",
+                  "timeout_ms": 1000
+                }
+              },
+              {
+                "name": "router",
+                "config": {}
+              }
+            ],
+            "access_log": [
+              {
+                "path": "/tmp/access.log"
+              }
+            ],
+            "use_remote_address": true
+          }
+        }
+      ]
+    }
+  ],
+  "admin": {
+    "access_log_path": "/tmp/admin_access.log",
+    "address": "tcp://0.0.0.0:8001"
+  },
+  "cluster_manager": {
+    "clusters": [
+      {
+        "name": "service_mercadolibre",
+        "connect_timeout_ms": 2500,
+        "type": "strict_dns",
+        "lb_type": "round_robin",
+        "hosts": [
+          {
+            "url": "tcp://api.mercadolibre.com:443"
+          }
+        ],
+        "ssl_context": {
+          "sni": "api.mercadolibre.com"
+        }
+      },
+      {
+        "name": "service_ratelimit",
+        "connect_timeout_ms": 2000,
+        "type": "strict_dns",
+        "lb_type": "round_robin",
+        "hosts": [
+          { "url": "tcp://ec2-54-227-43-190.compute-1.amazonaws.com:8081" },
+          { "url": "tcp://ec2-52-200-43-69.compute-1.amazonaws.com:8081" }
+        ],
+        "features": "http2"
+      }
+    ]
+  },
+  "rate_limit_service": {
+    "type": "grpc_service",
+    "config": {
+      "cluster_name": "service_ratelimit"
+    }
+  }
+}

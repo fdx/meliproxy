@@ -1,0 +1,270 @@
+#include "test/integration/integration.h"
+
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "envoy/buffer/buffer.h"
+#include "envoy/event/dispatcher.h"
+#include "envoy/http/header_map.h"
+
+#include "common/api/api_impl.h"
+#include "common/buffer/buffer_impl.h"
+#include "common/common/assert.h"
+#include "common/network/connection_impl.h"
+#include "common/network/utility.h"
+#include "common/upstream/upstream_impl.h"
+
+#include "test/integration/utility.h"
+#include "test/test_common/environment.h"
+#include "test/test_common/network_utility.h"
+
+#include "fmt/format.h"
+#include "gtest/gtest.h"
+
+using testing::AnyNumber;
+using testing::Invoke;
+using testing::NiceMock;
+using testing::_;
+
+namespace Envoy {
+
+IntegrationStreamDecoder::IntegrationStreamDecoder(Event::Dispatcher& dispatcher)
+    : dispatcher_(dispatcher) {}
+
+void IntegrationStreamDecoder::waitForHeaders() {
+  if (!headers_.get()) {
+    waiting_for_headers_ = true;
+    dispatcher_.run(Event::Dispatcher::RunType::Block);
+  }
+}
+
+void IntegrationStreamDecoder::waitForBodyData(uint64_t size) {
+  ASSERT(body_data_waiting_length_ == 0);
+  body_data_waiting_length_ = size;
+  dispatcher_.run(Event::Dispatcher::RunType::Block);
+}
+
+void IntegrationStreamDecoder::waitForEndStream() {
+  if (!saw_end_stream_) {
+    waiting_for_end_stream_ = true;
+    dispatcher_.run(Event::Dispatcher::RunType::Block);
+  }
+}
+
+void IntegrationStreamDecoder::waitForReset() {
+  if (!saw_reset_) {
+    waiting_for_reset_ = true;
+    dispatcher_.run(Event::Dispatcher::RunType::Block);
+  }
+}
+
+void IntegrationStreamDecoder::decodeHeaders(Http::HeaderMapPtr&& headers, bool end_stream) {
+  saw_end_stream_ = end_stream;
+  headers_ = std::move(headers);
+  if ((end_stream && waiting_for_end_stream_) || waiting_for_headers_) {
+    dispatcher_.exit();
+  }
+}
+
+void IntegrationStreamDecoder::decodeData(Buffer::Instance& data, bool end_stream) {
+  saw_end_stream_ = end_stream;
+  uint64_t num_slices = data.getRawSlices(nullptr, 0);
+  Buffer::RawSlice slices[num_slices];
+  data.getRawSlices(slices, num_slices);
+  for (Buffer::RawSlice& slice : slices) {
+    body_.append(static_cast<const char*>(slice.mem_), slice.len_);
+  }
+
+  if (end_stream && waiting_for_end_stream_) {
+    dispatcher_.exit();
+  } else if (body_data_waiting_length_ > 0) {
+    body_data_waiting_length_ -= std::min(body_data_waiting_length_, data.length());
+    if (body_data_waiting_length_ == 0) {
+      dispatcher_.exit();
+    }
+  }
+}
+
+void IntegrationStreamDecoder::decodeTrailers(Http::HeaderMapPtr&& trailers) {
+  saw_end_stream_ = true;
+  trailers_ = std::move(trailers);
+  if (waiting_for_end_stream_) {
+    dispatcher_.exit();
+  }
+}
+
+void IntegrationStreamDecoder::onResetStream(Http::StreamResetReason reason) {
+  saw_reset_ = true;
+  reset_reason_ = reason;
+  if (waiting_for_reset_) {
+    dispatcher_.exit();
+  }
+}
+
+IntegrationTcpClient::IntegrationTcpClient(Event::Dispatcher& dispatcher,
+                                           MockBufferFactory& factory, uint32_t port,
+                                           Network::Address::IpVersion version)
+    : payload_reader_(new WaitForPayloadReader(dispatcher)),
+      callbacks_(new ConnectionCallbacks(*this)) {
+  EXPECT_CALL(factory, create_(_, _))
+      .WillOnce(Invoke([&](std::function<void()> below_low,
+                           std::function<void()> above_high) -> Buffer::Instance* {
+        client_write_buffer_ = new MockWatermarkBuffer(below_low, above_high);
+        return client_write_buffer_;
+      }));
+
+  connection_ = dispatcher.createClientConnection(
+      Network::Utility::resolveUrl(
+          fmt::format("tcp://{}:{}", Network::Test::getLoopbackAddressUrlString(version), port)),
+      Network::Address::InstanceConstSharedPtr());
+
+  ON_CALL(*client_write_buffer_, drain(_))
+      .WillByDefault(testing::Invoke(client_write_buffer_, &MockWatermarkBuffer::baseDrain));
+  EXPECT_CALL(*client_write_buffer_, drain(_)).Times(AnyNumber());
+
+  connection_->addConnectionCallbacks(*callbacks_);
+  connection_->addReadFilter(payload_reader_);
+  connection_->connect();
+}
+
+void IntegrationTcpClient::close() { connection_->close(Network::ConnectionCloseType::NoFlush); }
+
+void IntegrationTcpClient::waitForData(const std::string& data) {
+  if (payload_reader_->data().find(data) == 0) {
+    return;
+  }
+
+  payload_reader_->set_data_to_wait_for(data);
+  connection_->dispatcher().run(Event::Dispatcher::RunType::Block);
+}
+
+void IntegrationTcpClient::waitForDisconnect() {
+  connection_->dispatcher().run(Event::Dispatcher::RunType::Block);
+  EXPECT_TRUE(disconnected_);
+}
+
+void IntegrationTcpClient::write(const std::string& data) {
+  Buffer::OwnedImpl buffer(data);
+  EXPECT_CALL(*client_write_buffer_, move(_));
+  EXPECT_CALL(*client_write_buffer_, write(_));
+
+  int bytes_expected = client_write_buffer_->bytes_written() + data.size();
+
+  connection_->write(buffer);
+  while (client_write_buffer_->bytes_written() != bytes_expected) {
+    connection_->dispatcher().run(Event::Dispatcher::RunType::NonBlock);
+  }
+}
+
+void IntegrationTcpClient::ConnectionCallbacks::onEvent(Network::ConnectionEvent event) {
+  if (event == Network::ConnectionEvent::RemoteClose) {
+    parent_.disconnected_ = true;
+    parent_.connection_->dispatcher().exit();
+  }
+}
+
+BaseIntegrationTest::BaseIntegrationTest(Network::Address::IpVersion version)
+    : api_(new Api::Impl(std::chrono::milliseconds(10000))),
+      mock_buffer_factory_(new NiceMock<MockBufferFactory>),
+      dispatcher_(new Event::DispatcherImpl(Buffer::WatermarkFactoryPtr{mock_buffer_factory_})),
+      version_(version), default_log_level_(TestEnvironment::getOptions().logLevel()) {
+  // This is a hack, but there are situations where we disconnect fake upstream connections and
+  // then we expect the server connection pool to get the disconnect before the next test starts.
+  // This does not always happen. This pause should allow the server to pick up the disconnect
+  // notification and clear the pool connection if necessary. A real fix would require adding fairly
+  // complex test hooks to the server and/or spin waiting on stats, neither of which I think are
+  // necessary right now.
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ON_CALL(*mock_buffer_factory_, create_(_, _))
+      .WillByDefault(Invoke([](std::function<void()> below_low,
+                               std::function<void()> above_high) -> Buffer::Instance* {
+        return new Buffer::WatermarkBuffer(below_low, above_high);
+      }));
+}
+
+Network::ClientConnectionPtr BaseIntegrationTest::makeClientConnection(uint32_t port) {
+  return dispatcher_->createClientConnection(
+      Network::Utility::resolveUrl(
+          fmt::format("tcp://{}:{}", Network::Test::getLoopbackAddressUrlString(version_), port)),
+      Network::Address::InstanceConstSharedPtr());
+}
+
+IntegrationTcpClientPtr BaseIntegrationTest::makeTcpConnection(uint32_t port) {
+  return IntegrationTcpClientPtr{
+      new IntegrationTcpClient(*dispatcher_, *mock_buffer_factory_, port, version_)};
+}
+
+void BaseIntegrationTest::registerPort(const std::string& key, uint32_t port) {
+  port_map_[key] = port;
+}
+
+uint32_t BaseIntegrationTest::lookupPort(const std::string& key) {
+  auto it = port_map_.find(key);
+  if (it != port_map_.end()) {
+    return it->second;
+  }
+  RELEASE_ASSERT(false);
+}
+
+void BaseIntegrationTest::registerTestServerPorts(const std::vector<std::string>& port_names) {
+  auto port_it = port_names.cbegin();
+  auto listeners = test_server_->server().listenerManager().listeners();
+  auto listener_it = listeners.cbegin();
+  for (; port_it != port_names.end() && listener_it != listeners.end(); ++port_it, ++listener_it) {
+    registerPort(*port_it, listener_it->get().socket().localAddress()->ip()->port());
+  }
+  registerPort("admin", test_server_->server().admin().socket().localAddress()->ip()->port());
+}
+
+void BaseIntegrationTest::createGeneratedApiTestServer(const std::string& bootstrap_path,
+                                                       const std::vector<std::string>& port_names) {
+  test_server_ = IntegrationTestServer::create(bootstrap_path, version_);
+  // Need to ensure we have an LDS update before invoking registerTestServerPorts() below that
+  // needs to know about the bound listener ports.
+  test_server_->waitForCounterGe("listener_manager.listener_create_success", 1);
+  registerTestServerPorts(port_names);
+}
+
+void BaseIntegrationTest::createApiTestServer(const ApiFilesystemConfig& api_filesystem_config,
+                                              const std::vector<std::string>& port_names) {
+  const std::string eds_path = TestEnvironment::temporaryFileSubstitute(
+      api_filesystem_config.eds_path_, port_map_, version_);
+  const std::string cds_path = TestEnvironment::temporaryFileSubstitute(
+      api_filesystem_config.cds_path_, {{"eds_json_path", eds_path}}, port_map_, version_);
+  const std::string rds_path = TestEnvironment::temporaryFileSubstitute(
+      api_filesystem_config.rds_path_, port_map_, version_);
+  const std::string lds_path = TestEnvironment::temporaryFileSubstitute(
+      api_filesystem_config.lds_path_, {{"rds_json_path", rds_path}}, port_map_, version_);
+  createGeneratedApiTestServer(TestEnvironment::temporaryFileSubstitute(
+                                   api_filesystem_config.bootstrap_path_,
+                                   {{"cds_json_path", cds_path}, {"lds_json_path", lds_path}},
+                                   port_map_, version_),
+                               port_names);
+}
+
+void BaseIntegrationTest::createTestServer(const std::string& json_path,
+                                           const std::vector<std::string>& port_names) {
+  test_server_ = IntegrationTestServer::create(
+      TestEnvironment::temporaryFileSubstitute(json_path, port_map_, version_), version_);
+  registerTestServerPorts(port_names);
+}
+
+void BaseIntegrationTest::sendRawHttpAndWaitForResponse(const char* raw_http,
+                                                        std::string* response) {
+  Buffer::OwnedImpl buffer(raw_http);
+  RawConnectionDriver connection(
+      lookupPort("http"), buffer,
+      [&](Network::ClientConnection&, const Buffer::Instance& data) -> void {
+        response->append(TestUtility::bufferToString(data));
+      },
+      version_);
+
+  connection.run();
+}
+
+} // namespace Envoy

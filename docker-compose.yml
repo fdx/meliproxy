@@ -1,0 +1,123 @@
+version: '2'
+services:
+
+  envoy:
+    build:
+      context: ./envoy
+      dockerfile: Dockerfile-compose
+    networks:
+      - envoymesh
+    networks:
+      envoymesh:
+        aliases:
+          - envoy
+    ports:
+      - "80:80"
+      - "8001:8001"
+    expose:
+      - "80"
+      - "8001"
+    volumes:
+      - ./runtime/logs:/logs/logs
+
+  ratelimit:
+    build:
+      context: ./ratelimit
+      dockerfile: Dockerfile
+    networks:
+      - envoymesh
+    networks:
+      envoymesh:
+        aliases:
+          - ratelimit
+    environment:
+      - USE_STATSD=false
+      - LOG_LEVEL=debug
+      - REDIS_SOCKET_TYPE=tcp
+      - REDIS_URL=redis:6379
+      - RUNTIME_ROOT=/runtime/data
+      - RUNTIME_SUBDIRECTORY=ratelimit
+    ports:
+      - "8081:8081"
+    expose:
+      - "8081"
+
+  redis:
+    image: "redis:alpine"
+    ports:
+      - "6379:6379"
+    networks:
+      envoymesh:
+        aliases:
+          - redis
+    expose:
+      - "6379"
+
+  mongo:
+    image: "mongo:latest"
+    ports:
+      - "27017:27017"
+    networks:
+      envoymesh:
+        aliases:
+          - mongo
+    expose:
+      - "27017"
+
+  zipkin:
+    image: "openzipkin/zipkin"
+    ports:
+      - "9411:9411"
+    expose:
+      - "9411"
+    networks:
+      envoymesh:
+        aliases:
+          - zipkin
+
+  logs:
+    build:
+      context: ./logs
+      dockerfile: Dockerfile
+    environment:
+      - MONGODB_HOST=mongo
+    networks:
+      - envoymesh
+    volumes:
+      - ./runtime/logs:/logs/logs
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    ports:
+      - "7000:7000"
+    expose:
+      - "7000"
+    environment:
+      - MONGODB_HOST=mongo
+      - SERVERS=envoy
+    networks:
+      envoymesh:
+        aliases:
+          - api
+
+  proxy-control:
+    build:
+      context: ./proxy-control
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    expose:
+      - "5000"
+    environment:
+      - MELI_PROXY_API_HOST=192.168.99.100
+    networks:
+      envoymesh:
+        aliases:
+          - proxy-control
+    links:
+      - api
+
+networks:
+  envoymesh: {}
