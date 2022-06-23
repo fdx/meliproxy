@@ -15,6 +15,6 @@
     "express-mongo-rest": "^0.1.2",
     "moment": "^2.19.1",
     "mongodb": "^2.2.33",
-    "node-fetch": "^1.7.3"
+    "node-fetch": "^2.6.7"
   }
 }
