@@ -11,7 +11,7 @@
   "dependencies": {
     "assert": "^1.4.1",
     "cors": "^2.8.4",
-    "express": "^4.16.2",
+    "express": "^4.18.2",
     "express-mongo-rest": "^0.1.2",
     "moment": "^2.19.1",
     "mongodb": "^2.2.33",
